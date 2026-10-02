@@ -3,3 +3,5 @@ mss
 numpy
 bleak
 cryptography
+pyobjc-framework-ScreenCaptureKit
+pyobjc-framework-Quartz
