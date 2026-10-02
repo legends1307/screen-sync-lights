@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Mirror the dominant screen colour onto a Tuya-based bulb (Havells DigiTap) over the LAN.
+"""Mirror the dominant screen colour onto a Tuya-based bulb (Havells DigiTap).
 
     python screensync.py --dry-run      # no bulb needed, shows the colour in the terminal
-    python screensync.py                # drives the bulb described in config.json
+    python screensync.py                # drives the bulb over Wi-Fi (same network as this Mac)
+    python screensync.py --ble          # drives the bulb over Bluetooth, no shared network needed
 """
 import argparse
+import asyncio
 import colorsys
 import json
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -27,9 +30,13 @@ DEFAULTS = {
     "max_brightness": 1.0,
     "saturation_boost": 1.3,
     "mode": "music",         # "music" = DP 27, bulb fades by itself; "colour" = plain DP 24
+    "transport": "wifi",     # "wifi" = LAN via tinytuya, "ble" = Bluetooth (same as --ble)
+    "uuid": "",              # Tuya uuid of the bulb, only needed for Bluetooth
+    "ble_exit_mode": "white",  # what the bulb returns to after a Bluetooth sync: white/colour/keep
 }
 
-DP_MODE, DP_COLOUR, DP_MUSIC = 21, 24, 27
+DP_SWITCH, DP_MODE, DP_COLOUR, DP_MUSIC = 20, 21, 24, 27
+WORK_MODES = ["white", "colour", "scene", "music"]  # enum order used over Bluetooth
 
 
 def load_config(path):
@@ -64,9 +71,15 @@ class Bulb:
         import tinytuya
 
         self.mode = cfg["mode"]
-        self.dev = tinytuya.BulbDevice(
-            cfg["device_id"], cfg["ip"], cfg["local_key"], version=float(cfg["version"])
-        )
+        try:
+            self.dev = tinytuya.BulbDevice(
+                cfg["device_id"], cfg["ip"], cfg["local_key"], version=float(cfg["version"])
+            )
+        except RuntimeError:
+            sys.exit(
+                "Bulb not found on this network. Check that it is switched on, shows online "
+                "in Smart Life, and is on the same Wi-Fi as this Mac."
+            )
         self.dev.set_socketPersistent(True)
         # The first connection attempt often fails, so try a few times.
         for _ in range(5):
@@ -103,6 +116,99 @@ class Bulb:
             self.last_beat = time.time()
 
 
+class BleBulb:
+    """Drives the bulb over Bluetooth LE from a background thread; reconnects if the link drops."""
+
+    def __init__(self, cfg):
+        if cfg["ble_exit_mode"] not in ("white", "colour", "keep"):
+            sys.exit('ble_exit_mode must be "white", "colour" or "keep".')
+        self.cfg = cfg
+        self.lock = threading.Lock()
+        self.latest = None  # newest colour not yet sent; older ones are simply dropped
+        self.current = None  # last colour asked for, re-sent after a reconnect
+        self.error = "no Tuya Bluetooth signal seen"
+        self.stopping = False
+        self.ready = threading.Event()
+        self.thread = threading.Thread(target=lambda: asyncio.run(self._run()), daemon=True)
+        self.thread.start()
+        print("Looking for the bulb over Bluetooth...")
+        if not self.ready.wait(60):
+            sys.exit(
+                f"Could not connect to the bulb over Bluetooth ({self.error}). Check that it is "
+                "switched on and within a few metres, and that this terminal is allowed to use "
+                "Bluetooth in System Settings > Privacy & Security."
+            )
+        print("Connected over Bluetooth.")
+
+    def _mode(self, name):
+        import tuya_ble
+
+        return tuya_ble.dp(DP_MODE, tuya_ble.DP_ENUM, bytes([WORK_MODES.index(name)]))
+
+    async def _run(self):
+        import tuya_ble
+
+        music = self.cfg["mode"] == "music"
+        while not self.stopping:
+            try:
+                bulb = await tuya_ble.connect(
+                    self.cfg["uuid"], self.cfg["device_id"], self.cfg["local_key"]
+                )
+            except Exception as exc:
+                self.error = str(exc)
+                if self.ready.is_set():
+                    print(f"\nBluetooth: {exc}; retrying")
+                await asyncio.sleep(2)
+                continue
+            try:
+                await bulb.write_dps(
+                    tuya_ble.dp(DP_SWITCH, tuya_ble.DP_BOOL, b"\x01")
+                    + self._mode("music" if music else "colour")
+                )
+                self.ready.set()
+                with self.lock:
+                    self.latest = self.current
+                while bulb.connected and not self.stopping:
+                    with self.lock:
+                        colour, self.latest = self.latest, None
+                    if not colour:
+                        await asyncio.sleep(0.02)
+                        continue
+                    hsv = "%04x%04x%04x" % colour
+                    if music:
+                        payload = tuya_ble.dp(DP_MUSIC, tuya_ble.DP_STRING, f"1{hsv}00000000".encode())
+                    else:
+                        payload = tuya_ble.dp(DP_COLOUR, tuya_ble.DP_STRING, hsv.encode())
+                    # Wait for the bulb's acknowledgement before sending the next colour: it
+                    # handles about 5 updates a second, and anything faster just queues up as lag.
+                    if not await bulb.write_dps(payload, timeout=0.6):
+                        with self.lock:
+                            self.latest = self.latest or colour  # retry unless a newer one came
+                if not self.stopping:
+                    print("\nBluetooth link dropped; reconnecting")
+                elif bulb.connected and self.cfg["ble_exit_mode"] != "keep":
+                    await bulb.write_dps(self._mode(self.cfg["ble_exit_mode"]))
+            except Exception as exc:
+                print(f"\nBluetooth: {exc}; reconnecting")
+            finally:
+                try:
+                    await bulb.disconnect()
+                except Exception:
+                    pass
+
+    def send(self, h, s, v):
+        with self.lock:
+            self.latest = self.current = (h, s, v)
+
+    def idle(self):
+        pass
+
+    def close(self):
+        self.stopping = True
+        self.thread.join(10)
+        print()
+
+
 class Preview:
     def send(self, h, s, v):
         r, g, b = (int(c * 255) for c in colorsys.hsv_to_rgb(h / 360, s / 1000, v / 1000))
@@ -120,15 +226,23 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     ap.add_argument("--dry-run", action="store_true", help="preview in the terminal, no bulb")
+    ap.add_argument("--ble", action="store_true", help="talk to the bulb over Bluetooth instead of Wi-Fi")
     args = ap.parse_args()
     cfg = load_config(args.config)
+    if args.ble:
+        cfg["transport"] = "ble"
 
     if args.dry_run:
         out = Preview()
     else:
         if not (cfg["device_id"] and cfg["local_key"]):
             sys.exit(f"Fill in device_id and local_key in {args.config} (or use --dry-run).")
-        out = Bulb(cfg)
+        if cfg["transport"] == "ble":
+            if not cfg["uuid"]:
+                sys.exit(f"Bluetooth needs the bulb's uuid in {args.config}.")
+            out = BleBulb(cfg)
+        else:
+            out = Bulb(cfg)
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     period = 1.0 / cfg["fps"]
